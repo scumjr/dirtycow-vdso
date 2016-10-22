@@ -25,11 +25,6 @@ whenever a process makes a call to `clock_gettime()`. It forks and executes a
 Python one-liner which creates a TCP reverse shell to the exploit.
 
 
-## Warning
-
-Make sure that the *missed* instructions in `payload.s` match your VDSO version.
-
-
 ## TODO
 
 - payload improvement
