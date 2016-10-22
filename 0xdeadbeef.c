@@ -62,6 +62,8 @@ static struct vdso_patch vdso_patch[2];
 static struct prologue prologues[] = {
 	/* push rbp; mov rbp, rsp; lfence */
 	{ "\x55\x48\x89\xe5\x0f\xae\xe8", 7 },
+	/* push rbp; mov rbp, rsp; push r14 */
+	{ "\x55\x48\x89\xe5\x41\x57", 6 },
 };
 
 
