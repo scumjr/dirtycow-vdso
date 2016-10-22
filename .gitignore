@@ -1,4 +1,4 @@
 *.o
 *.h
 payload
-dirtyvds0
+0xdeadbeef

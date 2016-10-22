@@ -1,12 +1,12 @@
 CFLAGS := -Wall
 LDFLAGS := -lpthread
 
-all: dirtyvds0
+all: 0xdeadbeef
 
-dirtyvds0: dirtyvds0.o
+0xdeadbeef: 0xdeadbeef.o
 	$(CC) -o $@ $^ $(LDFLAGS)
 
-dirtyvds0.o: dirtyvds0.c payload.h
+0xdeadbeef.o: 0xdeadbeef.c payload.h
 	$(CC) -o $@ -c $< $(CFLAGS)
 
 payload.h: payload
@@ -16,4 +16,4 @@ payload: payload.s
 	nasm -f bin -o $@ $^
 
 clean:
-	rm -f *.o *.h dirtyvds0
+	rm -f *.o *.h 0xdeadbeef
