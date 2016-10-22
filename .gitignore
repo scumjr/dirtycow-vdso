@@ -2,3 +2,4 @@
 *.h
 payload
 0xdeadbeef
+tools/dump_vdso
