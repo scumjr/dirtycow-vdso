@@ -138,6 +138,11 @@ static int build_vdso_patch(void *vdso_addr)
 	vdso_patch[1].size = 7;
 	vdso_patch[1].addr = (unsigned long)vdso_addr + clock_gettime_offset;
 
+	if (memcmp((void *)vdso_patch[1].addr, "\x55\x48\x89\xe5\x0f\xae\xe8", 7) != 0) {
+		fprintf(stderr, "[-] this vDSO doesn't match exploit's version\n");
+		return -1;
+	}
+
 	return 0;
 }
 
