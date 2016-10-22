@@ -64,6 +64,8 @@ static struct prologue prologues[] = {
 	{ "\x55\x48\x89\xe5\x0f\xae\xe8", 7 },
 	/* push rbp; mov rbp, rsp; push r14 */
 	{ "\x55\x48\x89\xe5\x41\x57", 6 },
+	/* psuh rbp; mov rbp, rdi; push rbx */
+	{ "\x55\x48\x89\xfd\x53", 5 },
 };
 
 
