@@ -334,17 +334,13 @@ static void *madviseThread(void *arg_)
 
 static int debuggee(void *arg_)
 {
-	pid_t pid;
+	if (prctl(PR_SET_PDEATHSIG, SIGKILL, 0, 0, 0) == -1)
+		err(1, "prctl(PR_SET_PDEATHSIG)");
 
 	if (ptrace(PTRACE_TRACEME, 0, NULL, NULL) == -1)
 		err(1, "ptrace(PTRACE_TRACEME)");
 
-	if (prctl(PR_SET_PDEATHSIG, SIGKILL, 0, 0, 0) == -1)
-		err(1, "prctl(PR_SET_PDEATHSIG)");
-
-	pid = getpid();
-	while (1)
-		kill(pid, SIGSTOP);
+	kill(getpid(), SIGSTOP);
 
 	return 0;
 }
@@ -371,16 +367,6 @@ static void *ptrace_thread(void *arg_)
 		return NULL;
 	}
 
-	if (ptrace(PTRACE_CONT, pid, NULL, NULL) == -1) {
-		warn("ptrace(PTRACE_CONT)");
-		return NULL;
-	}
-
-	if (waitpid(pid, &status, __WALL) == -1) {
-		warn("waitpid");
-		ret = NULL;
-	}
-
 	ret = NULL;
 	while (!arg->stop) {
 		if (arg->do_patch)
@@ -394,11 +380,8 @@ static void *ptrace_thread(void *arg_)
 		}
 	}
 
-	if (kill(pid, SIGKILL) == -1)
-		warn("kill(SIGKILL)");
-
-	if (kill(pid, SIGCONT) == -1)
-		warn("kill");
+	if (ptrace(PTRACE_CONT, pid, NULL, NULL) == -1)
+		warn("ptrace(PTRACE_CONT)");
 
 	if (waitpid(pid, NULL, __WALL) == -1)
 		warn("waitpid");
