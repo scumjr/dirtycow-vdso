@@ -519,9 +519,11 @@ int main(void)
 		return EXIT_FAILURE;
 
 	s = create_socket();
+	if (s == -1)
+		return EXIT_FAILURE;
 
 	if (exploit(&arg, true) == -1) {
-		fprintf(stderr, "exploit failed");
+		fprintf(stderr, "exploit failed\n");
 		return EXIT_FAILURE;
 	}
 
