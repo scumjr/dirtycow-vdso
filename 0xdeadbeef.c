@@ -549,10 +549,7 @@ static int yeah(int s)
 					break;
 				}
 			} else if (n == 0) {
-				fprintf(stderr, "[*] stdin closed\n");
-				nfds--;
-				if (nfds > 0)
-					fds[0] = fds[1];
+				break;
 			} else {
 				writeall(c, buf, n);
 			}
@@ -566,10 +563,7 @@ static int yeah(int s)
 					break;
 				}
 			} else if (n == 0) {
-				fprintf(stderr, "[*] socket closed\n");
-				nfds--;
-				if (nfds > 0)
-					fds[0] = fds[1];
+				break;
 			} else {
 				writeall(STDOUT_FILENO, buf, n);
 			}
