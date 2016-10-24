@@ -21,9 +21,10 @@ And a few cons:
 
 The current payload is almost the same as in
 [The Sea Watcher](https://github.com/scumjr/the-sea-watcher) and is executed
-whenever a process makes a call to `clock_gettime()`. It forks and executes a
-Python one-liner which creates a TCP reverse shell to the exploit. It isn't
-elegant but it could be used for container escape.
+whenever a process makes a call to `clock_gettime()`. If the process has root
+privileges and `/tmp/.x` doesn't exist, it forks, creates `/tmp/.x` and finally
+creates a TCP reverse shell to the exploit. It isn't elegant but it could be
+used for container escape.
 
 
 ## TODO
