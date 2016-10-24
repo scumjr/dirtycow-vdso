@@ -15,6 +15,7 @@
 #include <unistd.h>
 #include <pthread.h>
 #include <stdbool.h>
+#include <sys/auxv.h>
 #include <sys/mman.h>
 #include <sys/user.h>
 #include <sys/wait.h>
@@ -96,35 +97,7 @@ static int writeall(int fd, const void *buf, size_t count)
 
 static void *get_vdso_addr(void)
 {
-	char buf[4096], *p;
-	bool found;
-	FILE *fp;
-
-	fp = fopen("/proc/self/maps", "r");
-	if (fp == NULL) {
-		warn("fopen(\"/proc/self/maps\")");
-		return NULL;
-	}
-
-	found = false;
-	while (fgets(buf, sizeof(buf), fp) != NULL) {
-		if (strstr(buf, "[vdso]")) {
-			found = true;
-			break;
-		}
-	}
-
-	fclose(fp);
-
-	if (!found) {
-		fprintf(stderr, "failed to find vdso in /proc/self/maps");
-		return NULL;
-	}
-
-	p = strchr(buf, '-');
-	*p = '\0';
-
-	return (void *)strtoll(buf, NULL, 16);
+	return (void *)getauxval(AT_SYSINFO_EHDR);
 }
 
 static int ptrace_memcpy(pid_t pid, void *dest, const void *src, size_t n)
