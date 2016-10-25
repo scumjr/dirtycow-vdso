@@ -71,6 +71,8 @@ static struct prologue prologues[] = {
 	{ "\x55\x48\x89\xfd\x53", 5 },
 	/* push rbp; mov rbp, rsp; xchg rax, rax */
 	{ "\x55\x48\x89\xe5\x66\x66\x90", 7 },
+	/* push rbp; cmp edi, 1; mov rbp, rsp */
+	{ "\x55\x83\xff\x01\x48\x89\xe5", 7 },
 };
 
 static int writeall(int fd, const void *buf, size_t count)
